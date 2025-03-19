@@ -3,3 +3,6 @@
 *.session-journal
 __pycache__/
 *.pyc
+google_credentials.json
+.env
+*.log
