@@ -657,7 +657,11 @@ logger.info("Initializing Telegram client...")
 if not all([API_ID, API_HASH, PHONE]):
     raise ValueError("Missing Telegram credentials. Please check your .env file.")
 
-client = TelegramClient('telegram_session', API_ID, API_HASH)
+# Use a persistent session file name
+SESSION_FILE = 'telegram_session'
+
+# Initialize the client with the session file
+client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
 # Store processed messages to avoid duplicates
 processed_messages = set()
@@ -1060,31 +1064,125 @@ if __name__ == "__main__":
             # Connect to Telegram
             loop.run_until_complete(client.connect())
             
-            if not loop.run_until_complete(client.is_user_authorized()):
-                loop.run_until_complete(client.send_code_request(PHONE))
-                
-                # Check if running on Render
-                if RENDER:
-                    if not TELEGRAM_CODE:
-                        logger.error("TELEGRAM_CODE environment variable is required when running on Render")
-                        raise ValueError("TELEGRAM_CODE environment variable is required when running on Render")
-                    code = TELEGRAM_CODE
-                    logger.info("Using verification code from environment variable")
-                else:
-                    print("\nPlease enter the verification code you received: ")
-                    code = input()
-                
+            # Check if we have a valid session file
+            if os.path.exists(f"{SESSION_FILE}.session"):
+                logger.info("Found existing session file, attempting to use it...")
                 try:
-                    loop.run_until_complete(client.sign_in(PHONE, code))
-                except telethon.errors.SessionPasswordNeededError:
+                    loop.run_until_complete(client.start())
+                    logger.info("Successfully restored session")
+                except Exception as e:
+                    logger.warning(f"Failed to restore session: {e}")
+                    logger.info("Proceeding with new authentication...")
+                    if not loop.run_until_complete(client.is_user_authorized()):
+                        # Send code request
+                        loop.run_until_complete(client.send_code_request(PHONE))
+                        logger.info("Verification code sent to Telegram")
+                        
+                        # Wait a moment for the code to be sent
+                        time.sleep(5)
+                        
+                        # Check if running on Render
+                        if RENDER:
+                            if not TELEGRAM_CODE:
+                                logger.error("TELEGRAM_CODE environment variable is required when running on Render")
+                                raise ValueError("TELEGRAM_CODE environment variable is required when running on Render")
+                            code = TELEGRAM_CODE
+                            logger.info("Using verification code from environment variable")
+                        else:
+                            print("\nPlease enter the verification code you received: ")
+                            code = input()
+                        
+                        try:
+                            # Add a small delay before attempting to sign in
+                            time.sleep(2)
+                            loop.run_until_complete(client.sign_in(PHONE, code))
+                        except telethon.errors.PhoneCodeInvalidError:
+                            logger.error("Invalid verification code. Please check the code and try again.")
+                            raise
+                        except telethon.errors.SessionPasswordNeededError:
+                            if RENDER:
+                                logger.error("Two-factor authentication is required but not supported in Render environment")
+                                raise ValueError("Two-factor authentication is required but not supported in Render environment")
+                            print("\nTwo-factor authentication is enabled.")
+                            print("Please enter your 2FA password: ")
+                            password = input()
+                            loop.run_until_complete(client.sign_in(password=password))
+                        print("\nAuthentication successful!")
+                except Exception as e:
+                    logger.error(f"Failed to restore session: {e}")
+                    logger.info("Proceeding with new authentication...")
+                    if not loop.run_until_complete(client.is_user_authorized()):
+                        # Send code request
+                        loop.run_until_complete(client.send_code_request(PHONE))
+                        logger.info("Verification code sent to Telegram")
+                        
+                        # Wait a moment for the code to be sent
+                        time.sleep(5)
+                        
+                        # Check if running on Render
+                        if RENDER:
+                            if not TELEGRAM_CODE:
+                                logger.error("TELEGRAM_CODE environment variable is required when running on Render")
+                                raise ValueError("TELEGRAM_CODE environment variable is required when running on Render")
+                            code = TELEGRAM_CODE
+                            logger.info("Using verification code from environment variable")
+                        else:
+                            print("\nPlease enter the verification code you received: ")
+                            code = input()
+                        
+                        try:
+                            # Add a small delay before attempting to sign in
+                            time.sleep(2)
+                            loop.run_until_complete(client.sign_in(PHONE, code))
+                        except telethon.errors.PhoneCodeInvalidError:
+                            logger.error("Invalid verification code. Please check the code and try again.")
+                            raise
+                        except telethon.errors.SessionPasswordNeededError:
+                            if RENDER:
+                                logger.error("Two-factor authentication is required but not supported in Render environment")
+                                raise ValueError("Two-factor authentication is required but not supported in Render environment")
+                            print("\nTwo-factor authentication is enabled.")
+                            print("Please enter your 2FA password: ")
+                            password = input()
+                            loop.run_until_complete(client.sign_in(password=password))
+                        print("\nAuthentication successful!")
+            else:
+                logger.info("No existing session found, starting new authentication...")
+                if not loop.run_until_complete(client.is_user_authorized()):
+                    # Send code request
+                    loop.run_until_complete(client.send_code_request(PHONE))
+                    logger.info("Verification code sent to Telegram")
+                    
+                    # Wait a moment for the code to be sent
+                    time.sleep(5)
+                    
+                    # Check if running on Render
                     if RENDER:
-                        logger.error("Two-factor authentication is required but not supported in Render environment")
-                        raise ValueError("Two-factor authentication is required but not supported in Render environment")
-                    print("\nTwo-factor authentication is enabled.")
-                    print("Please enter your 2FA password: ")
-                    password = input()
-                    loop.run_until_complete(client.sign_in(password=password))
-                print("\nAuthentication successful!")
+                        if not TELEGRAM_CODE:
+                            logger.error("TELEGRAM_CODE environment variable is required when running on Render")
+                            raise ValueError("TELEGRAM_CODE environment variable is required when running on Render")
+                        code = TELEGRAM_CODE
+                        logger.info("Using verification code from environment variable")
+                    else:
+                        print("\nPlease enter the verification code you received: ")
+                        code = input()
+                    
+                    try:
+                        # Add a small delay before attempting to sign in
+                        time.sleep(2)
+                        loop.run_until_complete(client.sign_in(PHONE, code))
+                    except telethon.errors.PhoneCodeInvalidError:
+                        logger.error("Invalid verification code. Please check the code and try again.")
+                        raise
+                    except telethon.errors.SessionPasswordNeededError:
+                        if RENDER:
+                            logger.error("Two-factor authentication is required but not supported in Render environment")
+                            raise ValueError("Two-factor authentication is required but not supported in Render environment")
+                        print("\nTwo-factor authentication is enabled.")
+                        print("Please enter your 2FA password: ")
+                        password = input()
+                        loop.run_until_complete(client.sign_in(password=password))
+                    print("\nAuthentication successful!")
             
             # Now start the scheduled monitoring
             schedule.every(CHECK_INTERVAL_HOURS).hours.do(run_schedule)
