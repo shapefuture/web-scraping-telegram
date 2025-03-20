@@ -985,6 +985,9 @@ async def save_to_sheet(job_data):
         # Initialize Google Sheets client if not already done
         if not hasattr(save_to_sheet, 'sheet'):
             save_to_sheet.sheet = setup_google_sheet()
+            # Initialize a cache for the next available row
+            save_to_sheet.next_row = 2  # Start from row 2 (after headers)
+            save_to_sheet.last_fetch_time = 0
         
         # Determine schedule type and job type
         schedule_type = determine_schedule_type(job_data.get('what_they_offer', ''))
@@ -1013,21 +1016,66 @@ async def save_to_sheet(job_data):
             job_data.get('fit_percentage', '')
         ]
         
-        # Find the next empty row
-        next_row = 2  # Start from row 2 (after headers)
-        while next_row < 1000:  # Limit to prevent infinite loop
-            if not any(save_to_sheet.sheet.row_values(next_row)):
+        # Implement rate limiting with exponential backoff
+        current_time = time.time()
+        time_since_last_fetch = current_time - save_to_sheet.last_fetch_time
+        
+        # If we've made a request in the last second, add a delay
+        if time_since_last_fetch < 1:
+            await asyncio.sleep(1 - time_since_last_fetch)
+        
+        # Use batch operations to find the next empty row only occasionally
+        # Only fetch empty rows every 10 entries or if it's the first time
+        if not hasattr(save_to_sheet, 'rows_since_last_fetch'):
+            save_to_sheet.rows_since_last_fetch = 0
+            
+        if save_to_sheet.rows_since_last_fetch >= 10 or save_to_sheet.rows_since_last_fetch == 0:
+            try:
+                # Get all values in column A to find the next empty row
+                all_values = save_to_sheet.sheet.col_values(1)  # Column A
+                save_to_sheet.next_row = len(all_values) + 1
+                if save_to_sheet.next_row == 1:  # Empty sheet, add headers
+                    save_to_sheet.next_row = 2  # Skip header row
+                save_to_sheet.last_fetch_time = time.time()
+                save_to_sheet.rows_since_last_fetch = 0
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429:
+                    logger.warning("Rate limit exceeded when finding next row. Backing off and using estimated row.")
+                    # Use current next_row + 1 as a fallback
+                    save_to_sheet.next_row += 1
+                    # Add delay before proceeding
+                    await asyncio.sleep(2)
+                else:
+                    raise
+        else:
+            # If we haven't fetched the sheet data, assume the next row is the current + 1
+            save_to_sheet.next_row += 1
+            save_to_sheet.rows_since_last_fetch += 1
+            
+        # Try to add the row with exponential backoff
+        max_retries = 5
+        retry_delay = 1
+        
+        for retry in range(max_retries):
+            try:
+                # Append row to sheet
+                save_to_sheet.sheet.insert_row(row_data, save_to_sheet.next_row)
                 break
-            next_row += 1
-        
-        # Append row to sheet
-        save_to_sheet.sheet.insert_row(row_data, next_row)
-        
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429 and retry < max_retries - 1:
+                    logger.warning(f"Rate limit exceeded when inserting row. Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    raise
+                    
         logger.info(f"Saved job data to Google Sheet: {job_data.get('position', 'Unknown position')} with salary: {salary}")
         
     except Exception as e:
         logger.error(f"Error saving to Google Sheet: {str(e)}")
         logger.error("Full traceback:", exc_info=True)
+        # Continue processing other messages even if this one fails
+        # But still log it so we're aware
 
 def extract_email(text):
     """Extract email address from text."""
