@@ -12,7 +12,7 @@ import os
 import re
 import json
 from config import (
-    SPREADSHEET_ID, WORKSHEET_NAME,
+    WORKSHEET_NAME,
     CHANNELS,
     CHECK_INTERVAL_HOURS
 )
@@ -35,14 +35,21 @@ API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 PHONE = os.getenv('PHONE')
 GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
+GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 
 # Validate required environment variables
-if not all([API_ID, API_HASH, PHONE, GOOGLE_CREDENTIALS_JSON]):
-    missing_vars = []
-    if not API_ID: missing_vars.append('API_ID')
-    if not API_HASH: missing_vars.append('API_HASH')
-    if not PHONE: missing_vars.append('PHONE')
-    if not GOOGLE_CREDENTIALS_JSON: missing_vars.append('GOOGLE_CREDENTIALS_JSON')
+required_vars = {
+    'API_ID': API_ID,
+    'API_HASH': API_HASH,
+    'PHONE': PHONE,
+    'GOOGLE_CREDENTIALS_JSON': GOOGLE_CREDENTIALS_JSON,
+    'GOOGLE_SHEET_ID': GOOGLE_SHEET_ID
+}
+
+missing_vars = [var for var, value in required_vars.items() if not value]
+if missing_vars:
+    logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    logger.error("Please ensure all required environment variables are set in your .env file")
     raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
 # Print configuration (without sensitive data)
@@ -50,7 +57,7 @@ logger.info("=== Configuration ===")
 logger.info(f"API_ID is set: {bool(API_ID)}")
 logger.info(f"API_HASH is set: {bool(API_HASH)}")
 logger.info(f"PHONE is set: {bool(PHONE)}")
-logger.info(f"SPREADSHEET_ID is set: {bool(SPREADSHEET_ID)}")
+logger.info(f"GOOGLE_SHEET_ID is set: {bool(GOOGLE_SHEET_ID)}")
 logger.info(f"Monitoring channels: {CHANNELS}")
 logger.info(f"Check interval: {CHECK_INTERVAL_HOURS} hours")
 logger.info("==================")
@@ -584,6 +591,7 @@ def setup_google_sheet():
         try:
             credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {str(e)}")
             raise ValueError(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {str(e)}")
             
         scopes = [
@@ -597,7 +605,11 @@ def setup_google_sheet():
         gc = gspread.authorize(creds)
         
         # Get the spreadsheet
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+        except gspread.exceptions.APIError as e:
+            logger.error(f"Failed to access Google Sheet with ID {GOOGLE_SHEET_ID}: {str(e)}")
+            raise
         
         # Create or get the main worksheet
         try:
