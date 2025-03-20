@@ -434,13 +434,7 @@ def extract_telegram_link(text):
                     message_id = message_id_match.group(1)
                     # Add the message ID to the link
                     link = f"{link}/{message_id}"
-                else:
-                    # If no message ID found, try to find it in the message object
-                    if hasattr(message, 'id'):
-                        link = f"{link}/{message.id}"
-                    else:
-                        return None
-            
+                    
             # Clean up any remaining formatting
             link = re.sub(r'[^\w\s\-:/.]', '', link)
             return link
