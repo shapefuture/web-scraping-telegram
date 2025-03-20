@@ -1062,11 +1062,24 @@ if __name__ == "__main__":
             
             if not loop.run_until_complete(client.is_user_authorized()):
                 loop.run_until_complete(client.send_code_request(PHONE))
-                print("\nPlease enter the verification code you received: ")
-                code = input()
+                
+                # Check if running on Render
+                if RENDER:
+                    if not TELEGRAM_CODE:
+                        logger.error("TELEGRAM_CODE environment variable is required when running on Render")
+                        raise ValueError("TELEGRAM_CODE environment variable is required when running on Render")
+                    code = TELEGRAM_CODE
+                    logger.info("Using verification code from environment variable")
+                else:
+                    print("\nPlease enter the verification code you received: ")
+                    code = input()
+                
                 try:
                     loop.run_until_complete(client.sign_in(PHONE, code))
                 except telethon.errors.SessionPasswordNeededError:
+                    if RENDER:
+                        logger.error("Two-factor authentication is required but not supported in Render environment")
+                        raise ValueError("Two-factor authentication is required but not supported in Render environment")
                     print("\nTwo-factor authentication is enabled.")
                     print("Please enter your 2FA password: ")
                     password = input()
