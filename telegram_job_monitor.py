@@ -908,24 +908,39 @@ async def check_channels():
         logger.error("Full traceback:", exc_info=True)
 
 async def fetch_historical_messages(channel):
-    """Fetch historical messages from a channel."""
+    """Fetch historical messages from a channel with memory optimization."""
     try:
         logger.info(f"Fetching historical messages from {channel.title}")
         
-        # Get messages from the last 30 days
+        # Reduce the limit for Render to save memory
+        message_limit = 30 if RENDER else 100
+        day_limit = 7 if RENDER else 30
+        
+        # Get messages from the last N days with reduced limit
         messages = await client.get_messages(
             channel,
-            limit=100,
-            offset_date=datetime.now() - timedelta(days=30)
+            limit=message_limit,
+            offset_date=datetime.now() - timedelta(days=day_limit)
         )
         
         logger.info(f"Retrieved {len(messages)} messages from {channel.title}")
         
-        # Process each message
-        for message in messages:
+        # Process each message with periodic garbage collection
+        for i, message in enumerate(messages):
             if message.id not in processed_messages:
                 await process_message(message, channel.title)
                 processed_messages.add(message.id)
+                
+                # Save processed messages periodically to avoid keeping too many in memory
+                if i % 10 == 0:
+                    save_processed_messages(processed_messages)
+                    
+                    # Process the queue to avoid memory buildup
+                    if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
+                        await process_queue()
+                    
+                    # Short sleep to avoid rate limits and reduce CPU usage
+                    await asyncio.sleep(0.1)
                 
     except Exception as e:
         logger.error(f"Error fetching historical messages from {channel.title}: {str(e)}")
@@ -981,39 +996,68 @@ async def main():
             await client.disconnect()
 
 def run_schedule():
-    """Run the monitoring process using schedule."""
+    """Run the monitoring process using schedule with memory optimizations."""
     logger.info("Starting scheduled task...")
+    
+    # Log memory usage if psutil is available
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        logger.info(f"Current memory usage: {mem_info.rss / 1024 / 1024:.2f} MB")
+    except ImportError:
+        logger.info("psutil not available, skipping memory usage logging")
     
     async def run_monitoring():
         try:
             # Clean up old message IDs (older than 30 days)
             current_time = time.time()
-            old_messages = {msg_id for msg_id in processed_messages if current_time - msg_id > 30 * 24 * 60 * 60}
+            cutoff_time = current_time - (7 * 24 * 60 * 60 if RENDER else 30 * 24 * 60 * 60)
+            old_messages = {msg_id for msg_id in processed_messages if msg_id < cutoff_time}
             if old_messages:
                 processed_messages.difference_update(old_messages)
                 save_processed_messages(processed_messages)
                 logger.info(f"Cleaned up {len(old_messages)} old message IDs")
             
-            # First, fetch historical messages from all channels
-            print("\nFetching historical messages from all channels...")
-            for channel_id in CHANNELS:
-                try:
-                    channel = await client.get_entity(channel_id)
-                    await fetch_historical_messages(channel)
-                    print(f"Successfully fetched historical messages from {channel.title}")
-                    # Process queue after each channel to avoid accumulating too many items
-                    if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
-                        await process_queue()
-                        # Add a delay between channels to stay within rate limits
-                        await asyncio.sleep(5)
-                except Exception as e:
-                    logger.error(f"Error processing historical messages for {channel_id}: {e}")
-                    logger.exception("Full traceback:")
+            # Process channels in smaller batches to manage memory
+            print("\nFetching historical messages from channels...")
+            chunks = [CHANNELS[i:i+5] for i in range(0, len(CHANNELS), 5)]
             
-            # Process any remaining queued items
-            if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
-                await process_queue()
+            for chunk in chunks:
+                for channel_id in chunk:
+                    try:
+                        channel = await client.get_entity(channel_id)
+                        await fetch_historical_messages(channel)
+                        print(f"Successfully fetched historical messages from {channel.title}")
+                        # Process queue after each channel
+                        if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
+                            await process_queue()
+                        # Add a delay between channels
+                        await asyncio.sleep(5)
+                    except Exception as e:
+                        logger.error(f"Error processing historical messages for {channel_id}: {e}")
+                        logger.exception("Full traceback:")
                 
+                # Process any remaining queued items after each chunk
+                if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
+                    await process_queue()
+                
+                # Log memory usage after processing each chunk
+                try:
+                    import psutil
+                    process = psutil.Process(os.getpid())
+                    mem_info = process.memory_info()
+                    logger.info(f"Memory usage after chunk: {mem_info.rss / 1024 / 1024:.2f} MB")
+                except ImportError:
+                    pass
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
+                # Add a longer delay between chunks to reduce memory pressure
+                await asyncio.sleep(15)
+            
             # Then check for new messages
             await check_channels()
             
@@ -1030,7 +1074,7 @@ def run_schedule():
     loop.run_until_complete(run_monitoring())
 
 async def save_to_sheet(job_data):
-    """Save job data to Google Sheet."""
+    """Save job data to Google Sheet with memory optimization."""
     try:
         # Initialize Google Sheets client and batch queue if not already done
         if not hasattr(save_to_sheet, 'sheet'):
@@ -1074,10 +1118,14 @@ async def save_to_sheet(job_data):
         queue_size = len(save_to_sheet.queue)
         time_since_last_batch = current_time - save_to_sheet.last_batch_time
         
+        # Use smaller batch size on Render to reduce memory usage
+        max_batch_size = 5 if RENDER else 10
+        batch_interval = 20 if RENDER else 30  # seconds
+        
         # Process the queue if:
-        # 1. We have collected 10 or more rows, or
-        # 2. It's been more than 30 seconds since the last batch
-        if queue_size >= 10 or (queue_size > 0 and time_since_last_batch > 30):
+        # 1. We have collected enough rows, or
+        # 2. It's been enough time since the last batch
+        if queue_size >= max_batch_size or (queue_size > 0 and time_since_last_batch > batch_interval):
             await process_queue()
         
         logger.info(f"Queued job data: {job_data.get('position', 'Unknown position')} from {job_data.get('channel', '')}")
@@ -1188,15 +1236,20 @@ if __name__ == "__main__":
     # Create a client instance
     client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     
-    # First, test the parser
-    print("Testing job vacancy parser...")
-    test_message = "Официант Лолита\nhttps://vitrina.jobs/card/?filters638355975=id__eq__1745&utm_source=tg&utm_medium=vacancy_17.02-23.02&utm_campaign=horeca_oficiant_lolita\n\nОфициант Лолита\nМы очень уютный ресторан расположенный в старинном особняке 18 века Демидовых, Рахмановых на Таганской, с открытой кухней и сногсшибательной атмосферой.\n📍 Москва"
-    job_data = parse_job_vacancy(test_message)
-    print("\nTest Results:")
-    for key, value in job_data.items():
-        print(f"{key}: {value}")
-        
-    print("\nParser test successful! Starting the main script...")
+    # Check if we're running on Render to skip tests
+    if RENDER:
+        print("Running on Render, skipping tests to conserve memory")
+    else:
+        # First, test the parser (only when not on Render)
+        print("Testing job vacancy parser...")
+        test_message = "Официант Лолита\nhttps://vitrina.jobs/card/?filters638355975=id__eq__1745&utm_source=tg&utm_medium=vacancy_17.02-23.02&utm_campaign=horeca_oficiant_lolita\n\nОфициант Лолита\nМы очень уютный ресторан расположенный в старинном особняке 18 века Демидовых, Рахмановых на Таганской, с открытой кухней и сногсшибательной атмосферой.\n📍 Москва"
+        job_data = parse_job_vacancy(test_message)
+        print("\nTest Results:")
+        for key, value in job_data.items():
+            print(f"{key}: {value}")
+            
+        print("\nParser test successful! Starting the main script...")
+    
     loop = asyncio.get_event_loop()
     try:
         logger.info("Script started")
@@ -1302,7 +1355,4 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
         finally:
-            loop.close()
-
-    # Add this line at the end of the file, just before the if __name__ == "__main__": block
-    test_salary_parsing() 
+            loop.close() 
