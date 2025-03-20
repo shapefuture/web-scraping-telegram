@@ -38,6 +38,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
 GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 RENDER = os.getenv('RENDER', '').lower() == 'true'
 TELEGRAM_CODE = os.getenv('TELEGRAM_CODE')
+SESSION_FILE = 'session'  # Changed from 'anon' to 'session' to match existing session file
 
 # Validate required environment variables
 required_vars = {
@@ -472,7 +473,7 @@ def clean_position_text(text):
     
     return text.strip()
 
-def parse_job_vacancy(text):
+def parse_job_vacancy(text, channel_name=None):
     """Parse job vacancy text to extract specific fields."""
     # Initialize result dictionary
     result = {
@@ -480,7 +481,7 @@ def parse_job_vacancy(text):
         'application_link': '',
         'telegram_link': '',
         'what_they_offer': '',
-        'source': '',
+        'source': channel_name if channel_name else '',
         'fit_percentage': 'TBD',
         'priority': 'TBD',
         'high_salary': False,
@@ -597,7 +598,18 @@ def setup_google_sheet():
         
         # Parse Google credentials from environment variable
         try:
-            credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+            # First, try to parse the JSON string directly
+            try:
+                credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+            except json.JSONDecodeError:
+                # If that fails, try to clean the string first
+                cleaned_json = GOOGLE_CREDENTIALS_JSON.replace('\n', '\\n')
+                credentials_dict = json.loads(cleaned_json)
+                
+            # Ensure the private key is properly formatted
+            if 'private_key' in credentials_dict:
+                credentials_dict['private_key'] = credentials_dict['private_key'].replace('\\n', '\n')
+                
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {str(e)}")
             raise ValueError(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {str(e)}")
@@ -658,7 +670,7 @@ if not all([API_ID, API_HASH, PHONE]):
     raise ValueError("Missing Telegram credentials. Please check your .env file.")
 
 # Use a persistent session file name
-SESSION_FILE = 'telegram_session'
+SESSION_FILE = 'session'
 
 # Initialize the client with the session file
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
@@ -895,29 +907,28 @@ async def main():
     try:
         # Initialize Telegram client
         logger.info("Initializing Telegram client...")
-        client = TelegramClient('anon', API_ID, API_HASH)
+        client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
         
         # Start the client
         await client.start(phone=PHONE)
         
         # If running on Render, use the TELEGRAM_CODE environment variable
-        if RENDER:
+        if RENDER and not client.is_user_authorized():
             logger.info("Running on Render, using TELEGRAM_CODE from environment")
             try:
-                await client.sign_in(code=TELEGRAM_CODE)
+                await client.sign_in(phone=PHONE, code=TELEGRAM_CODE)
             except telethon.errors.SessionPasswordNeededError:
                 logger.error("Two-factor authentication is required but not supported in Render environment")
                 raise
         else:
-            logger.info("Running locally, using interactive authentication")
-            await client.start()
+            logger.info("Running locally or already authenticated")
         
         logger.info("Successfully authenticated with Telegram")
         
         # Test the parser
         logger.info("Testing job vacancy parser...")
         test_message = "Официант Лолита\nhttps://vitrina.jobs/card/?filters638355975=id__eq__1745&utm_source=tg&utm_medium=vacancy_17.02-23.02&utm_campaign=horeca_oficiant_lolita\n\nОфициант Лолита\nМы очень уютный ресторан расположенный в старинном особняке 18 века Демидовых, Рахмановых на Таганской, с открытой кухней и сногсшибательной атмосферой.\n📍 Москва"
-        job_data = parse_job_vacancy(test_message, "test_channel")
+        job_data = parse_job_vacancy(test_message)
         logger.info("\nTest Results:")
         for key, value in job_data.items():
             logger.info(f"{key}: {value}")
@@ -1041,68 +1052,121 @@ def determine_job_type(text):
     return ', '.join(job_types) if job_types else 'Other'
 
 if __name__ == "__main__":
-    # Test the parser first
-    print("Testing job vacancy parser...")
-    test_result = test_parse_job_vacancy()
+    # Create a client instance
+    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     
-    # Continue with the main script if test is successful
-    if test_result['position']:
-        print("\nParser test successful! Starting the main script...")
-        loop = asyncio.get_event_loop()
+    # First, test the parser
+    print("Testing job vacancy parser...")
+    test_message = "Официант Лолита\nhttps://vitrina.jobs/card/?filters638355975=id__eq__1745&utm_source=tg&utm_medium=vacancy_17.02-23.02&utm_campaign=horeca_oficiant_lolita\n\nОфициант Лолита\nМы очень уютный ресторан расположенный в старинном особняке 18 века Демидовых, Рахмановых на Таганской, с открытой кухней и сногсшибательной атмосферой.\n📍 Москва"
+    job_data = parse_job_vacancy(test_message)
+    print("\nTest Results:")
+    for key, value in job_data.items():
+        print(f"{key}: {value}")
+        
+    print("\nParser test successful! Starting the main script...")
+    loop = asyncio.get_event_loop()
+    try:
+        logger.info("Script started")
+        
+        # Test Google Sheets connection
+        logger.info("Testing Google Sheets connection...")
+        setup_google_sheet()
+        
+        # Run authentication first
+        print("\n=== Telegram Channel Monitor ===")
+        print("Starting authentication process...")
+        print(f"Using phone number: {PHONE}")
+        
+        # Connect to Telegram
+        loop.run_until_complete(client.connect())
+        
+        # Try to use existing session
         try:
-            logger.info("Script started")
-            
-            # Test Google Sheets connection
-            logger.info("Testing Google Sheets connection...")
-            setup_google_sheet()
-            
-            # Run authentication first
-            print("\n=== Telegram Channel Monitor ===")
-            print("Starting authentication process...")
-            print(f"Using phone number: {PHONE}")
-            
-            # Connect to Telegram
-            loop.run_until_complete(client.connect())
-            
-            # Try to use existing session
-            try:
-                logger.info("Attempting to use existing session...")
-                # Check if session file exists
-                if os.path.exists(f"{SESSION_FILE}.session"):
-                    # Try to sign in without prompting
-                    loop.run_until_complete(client.sign_in())
-                    logger.info("Successfully authenticated using existing session")
+            logger.info("Attempting to use existing session...")
+            # Check if session file exists
+            if os.path.exists(f"{SESSION_FILE}.session"):
+                # Make sure to properly await the coroutine
+                is_authorized = loop.run_until_complete(client.is_user_authorized())
+                if not is_authorized:
+                    # If not authorized, try to sign in
+                    if RENDER and TELEGRAM_CODE:
+                        logger.info("Using TELEGRAM_CODE from environment for authentication")
+                        # First connect
+                        loop.run_until_complete(client.connect())
+                        # Then sign in with code
+                        loop.run_until_complete(client.sign_in(phone=PHONE, code=TELEGRAM_CODE))
+                    else:
+                        logger.info("Interactive authentication required")
+                        # Use the built-in interactive sign-in process
+                        loop.run_until_complete(client.connect())
+                        if not loop.run_until_complete(client.is_user_authorized()):
+                            loop.run_until_complete(client.send_code_request(PHONE))
+                            code = input('Please enter the code you received: ')
+                            loop.run_until_complete(client.sign_in(phone=PHONE, code=code))
                 else:
-                    logger.error("No session file found. Please run the script locally first to create a session file")
-                    raise FileNotFoundError("No session file found")
-            except Exception as e:
-                logger.error(f"Failed to use existing session: {e}")
-                logger.error("Please run the script locally first to create a session file")
-                raise
-            
-            print("\nAuthentication successful!")
-            
-            # Now start the scheduled monitoring
-            schedule.every(CHECK_INTERVAL_HOURS).hours.do(run_schedule)
-            run_schedule()  # Run immediately instead of waiting for the first interval
-            
-            while True:
-                schedule.run_pending()
-                time.sleep(60)
-            
-        except KeyboardInterrupt:
-            logger.info("Script stopped by user")
-            print("\nScript stopped by user. Press Ctrl+C again to exit.")
-        except Exception as e:
-            logger.error(f"Script stopped due to error: {e}")
-            logger.exception("Full traceback:")
-            print(f"\nError: {e}")
-        finally:
-            # Ensure proper cleanup
+                    logger.info("Already authenticated using existing session")
+            else:
+                logger.info("No session file found. Creating new session...")
+                if RENDER and TELEGRAM_CODE:
+                    logger.info("Using TELEGRAM_CODE from environment for initial authentication")
+                    # First connect
+                    loop.run_until_complete(client.connect())
+                    # Send code request
+                    loop.run_until_complete(client.send_code_request(PHONE))
+                    # Then sign in with code
+                    loop.run_until_complete(client.sign_in(phone=PHONE, code=TELEGRAM_CODE))
+                else:
+                    logger.info("Interactive authentication required")
+                    # Use the built-in interactive sign-in process
+                    loop.run_until_complete(client.connect())
+                    if not loop.run_until_complete(client.is_user_authorized()):
+                        loop.run_until_complete(client.send_code_request(PHONE))
+                        code = input('Please enter the code you received: ')
+                        loop.run_until_complete(client.sign_in(phone=PHONE, code=code))
+                    
+            # Verify authentication by trying to get your own user info
             try:
-                if client.is_connected():
-                    loop.run_until_complete(client.disconnect())
+                me = loop.run_until_complete(client.get_me())
+                if me:
+                    logger.info(f"Successfully authenticated as {me.first_name if hasattr(me, 'first_name') else 'Unknown'} (id: {me.id if hasattr(me, 'id') else 'Unknown'})")
+                else:
+                    logger.error("Authentication verification failed: get_me() returned None")
+                    raise ValueError("Authentication verification failed")
             except Exception as e:
-                logger.error(f"Error during cleanup: {e}")
-            finally:
-                loop.close() 
+                logger.error(f"Failed to verify authentication: {e}")
+                raise
+                
+        except Exception as e:
+            logger.error(f"Failed to authenticate: {e}")
+            if RENDER:
+                logger.error("Please ensure TELEGRAM_CODE environment variable is set correctly")
+            else:
+                logger.error("Please run the script locally first to create a session file")
+            raise
+        
+        print("\nAuthentication successful!")
+        
+        # Now start the scheduled monitoring
+        schedule.every(CHECK_INTERVAL_HOURS).hours.do(run_schedule)
+        run_schedule()  # Run immediately instead of waiting for the first interval
+        
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+        
+    except KeyboardInterrupt:
+        logger.info("Script stopped by user")
+        print("\nScript stopped by user. Press Ctrl+C again to exit.")
+    except Exception as e:
+        logger.error(f"Script stopped due to error: {e}")
+        logger.exception("Full traceback:")
+        print(f"\nError: {e}")
+    finally:
+        # Ensure proper cleanup
+        try:
+            if client.is_connected():
+                loop.run_until_complete(client.disconnect())
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        finally:
+            loop.close() 
