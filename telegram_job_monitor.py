@@ -17,6 +17,7 @@ from config import (
     CHECK_INTERVAL_HOURS
 )
 import telethon.errors
+import pickle
 
 # Set up logging with more detailed format
 logging.basicConfig(
@@ -39,6 +40,9 @@ GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 RENDER = os.getenv('RENDER', '').lower() == 'true'
 TELEGRAM_CODE = os.getenv('TELEGRAM_CODE')
 SESSION_FILE = 'session'  # Changed from 'anon' to 'session' to match existing session file
+
+# Add after other global variables
+PROCESSED_MESSAGES_FILE = 'processed_messages.pkl'
 
 # Validate required environment variables
 required_vars = {
@@ -233,6 +237,28 @@ SALARY_PATTERNS = [
     r'salary:\s*([^\n]+)',
     r'salary\s*([^\n]+)'
 ]
+
+def test_salary_parsing():
+    """Test the salary parsing function with various formats."""
+    test_cases = [
+        "300-2000$",
+        "1.2-2.5к$",
+        "75 000 - 150 000 рублей",
+        "2000-3000$",
+        "от 80 000 до 120 000 ₽",
+        "100k-200k$",
+        "1.5k-2.5k USD",
+        "150 000 - 250 000 руб",
+        "€2000-3000",
+        "2000€-3000€"
+    ]
+    
+    print("\nTesting salary parsing:")
+    for test in test_cases:
+        is_high, salary = parse_salary(test)
+        print(f"\nInput: {test}")
+        print(f"Is high salary: {is_high}")
+        print(f"Parsed salary: {salary}")
 
 def parse_salary(salary_text):
     """Parse salary text to determine if it's a high salary position and extract the salary value."""
@@ -670,7 +696,7 @@ SESSION_FILE = 'session'
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
 # Store processed messages to avoid duplicates
-processed_messages = set()
+processed_messages = load_processed_messages()
 
 def determine_schedule_type(text):
     """Determine if the job has flexible schedule or low hours demand."""
@@ -790,6 +816,11 @@ def is_remote_job(text):
 async def process_message(message, channel_name):
     """Process a single message and save job data if it's a remote job vacancy."""
     try:
+        # Skip if message has already been processed
+        if message.id in processed_messages:
+            logger.debug(f"Skipping already processed message {message.id} from {channel_name}")
+            return
+            
         # Extract message text
         text = message.text if message.text else ""
         
@@ -834,6 +865,10 @@ async def process_message(message, channel_name):
         
         # Save to Google Sheet
         await save_to_sheet(job_data)
+        
+        # Mark message as processed
+        processed_messages.add(message.id)
+        save_processed_messages(processed_messages)
         
         logger.info(f"Saved remote job vacancy: {job_data.get('position', 'Unknown position')} from {channel_name}")
     except Exception as e:
@@ -951,6 +986,14 @@ def run_schedule():
     
     async def run_monitoring():
         try:
+            # Clean up old message IDs (older than 30 days)
+            current_time = time.time()
+            old_messages = {msg_id for msg_id in processed_messages if current_time - msg_id > 30 * 24 * 60 * 60}
+            if old_messages:
+                processed_messages.difference_update(old_messages)
+                save_processed_messages(processed_messages)
+                logger.info(f"Cleaned up {len(old_messages)} old message IDs")
+            
             # First, fetch historical messages from all channels
             print("\nFetching historical messages from all channels...")
             for channel_id in CHANNELS:
@@ -1123,6 +1166,24 @@ def determine_job_type(text):
         
     return ', '.join(job_types) if job_types else 'Other'
 
+def load_processed_messages():
+    """Load the set of processed message IDs from file."""
+    try:
+        if os.path.exists(PROCESSED_MESSAGES_FILE):
+            with open(PROCESSED_MESSAGES_FILE, 'rb') as f:
+                return pickle.load(f)
+    except Exception as e:
+        logger.error(f"Error loading processed messages: {e}")
+    return set()
+
+def save_processed_messages(processed_messages):
+    """Save the set of processed message IDs to file."""
+    try:
+        with open(PROCESSED_MESSAGES_FILE, 'wb') as f:
+            pickle.dump(processed_messages, f)
+    except Exception as e:
+        logger.error(f"Error saving processed messages: {e}")
+
 if __name__ == "__main__":
     # Create a client instance
     client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
@@ -1241,4 +1302,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
         finally:
-            loop.close() 
+            loop.close()
+
+    # Add this line at the end of the file, just before the if __name__ == "__main__": block
+    test_salary_parsing() 
