@@ -36,6 +36,8 @@ API_HASH = os.getenv('API_HASH')
 PHONE = os.getenv('PHONE')
 GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
 GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
+RENDER = os.getenv('RENDER', '').lower() == 'true'
+TELEGRAM_CODE = os.getenv('TELEGRAM_CODE')
 
 # Validate required environment variables
 required_vars = {
@@ -52,12 +54,18 @@ if missing_vars:
     logger.error("Please ensure all required environment variables are set in your .env file")
     raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
+# If running on Render, validate TELEGRAM_CODE
+if RENDER and not TELEGRAM_CODE:
+    logger.error("TELEGRAM_CODE environment variable is required when running on Render")
+    raise ValueError("TELEGRAM_CODE environment variable is required when running on Render")
+
 # Print configuration (without sensitive data)
 logger.info("=== Configuration ===")
 logger.info(f"API_ID is set: {bool(API_ID)}")
 logger.info(f"API_HASH is set: {bool(API_HASH)}")
 logger.info(f"PHONE is set: {bool(PHONE)}")
 logger.info(f"GOOGLE_SHEET_ID is set: {bool(GOOGLE_SHEET_ID)}")
+logger.info(f"Running on Render: {RENDER}")
 logger.info(f"Monitoring channels: {CHANNELS}")
 logger.info(f"Check interval: {CHECK_INTERVAL_HOURS} hours")
 logger.info("==================")
@@ -879,53 +887,54 @@ async def fetch_historical_messages(channel):
         logger.error("Full traceback:", exc_info=True)
 
 async def main():
-    """Main function to run the monitoring process."""
+    """Main function to run the Telegram job monitor."""
     try:
-        print("\n=== Telegram Channel Monitor ===")
-        print("Starting authentication process...")
-        print(f"Using phone number: {PHONE}")
+        # Initialize Telegram client
+        logger.info("Initializing Telegram client...")
+        client = TelegramClient('anon', API_ID, API_HASH)
         
-        # Start client without phone
-        await client.connect()
+        # Start the client
+        await client.start(phone=PHONE)
         
-        if not await client.is_user_authorized():
-            await client.send_code_request(PHONE)
-            print("\nPlease enter the verification code you received: ")
-            code = input()
+        # If running on Render, use the TELEGRAM_CODE environment variable
+        if RENDER:
+            logger.info("Running on Render, using TELEGRAM_CODE from environment")
             try:
-                await client.sign_in(PHONE, code)
+                await client.sign_in(code=TELEGRAM_CODE)
             except telethon.errors.SessionPasswordNeededError:
-                print("\nTwo-factor authentication is enabled.")
-                print("Please enter your 2FA password: ")
-                password = input()
-                await client.sign_in(password=password)
-            print("\nAuthentication successful!")
+                logger.error("Two-factor authentication is required but not supported in Render environment")
+                raise
+        else:
+            logger.info("Running locally, using interactive authentication")
+            await client.start()
         
-        logger.info("Telegram client started successfully")
+        logger.info("Successfully authenticated with Telegram")
         
-        # First, fetch historical messages from all channels
-        print("\nFetching historical messages from all channels...")
-        for channel_id in CHANNELS:
-            try:
-                channel = await client.get_entity(channel_id)
-                await fetch_historical_messages(channel)
-            except Exception as e:
-                logger.error(f"Error processing historical messages for {channel_id}: {e}")
-                logger.exception("Full traceback:")
+        # Test the parser
+        logger.info("Testing job vacancy parser...")
+        test_message = "Официант Лолита\nhttps://vitrina.jobs/card/?filters638355975=id__eq__1745&utm_source=tg&utm_medium=vacancy_17.02-23.02&utm_campaign=horeca_oficiant_lolita\n\nОфициант Лолита\nМы очень уютный ресторан расположенный в старинном особняке 18 века Демидовых, Рахмановых на Таганской, с открытой кухней и сногсшибательной атмосферой.\n📍 Москва"
+        job_data = parse_job_vacancy(test_message, "test_channel")
+        logger.info("\nTest Results:")
+        for key, value in job_data.items():
+            logger.info(f"{key}: {value}")
+        logger.info("\nParser test successful! Starting the main script...")
         
-        print("\nStarting to monitor channels for new messages...\n")
+        # Set up Google Sheets
+        logger.info("Testing Google Sheets connection...")
+        sheet = setup_google_sheet()
+        logger.info("Google Sheets connection successful!")
         
-        while True:
-            await check_channels()
-            logger.info(f"Waiting {CHECK_INTERVAL_HOURS} hours before next check...")
-            await asyncio.sleep(CHECK_INTERVAL_HOURS * 3600)  # Convert hours to seconds
-            
+        # Start monitoring
+        logger.info("Script started")
+        await monitor_channels(client, sheet)
+        
     except Exception as e:
-        logger.error(f"Error in main: {e}")
-        logger.exception("Full traceback:")
-        print(f"\nError: {e}")
+        logger.error(f"Script stopped due to error: {str(e)}")
+        logger.error("Full traceback:", exc_info=True)
+        raise
     finally:
-        await client.disconnect()
+        if 'client' in locals():
+            await client.disconnect()
 
 def run_schedule():
     """Run the monitoring process using schedule."""
