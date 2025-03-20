@@ -611,7 +611,7 @@ def parse_job_vacancy(text, channel_name=None):
 
 # Initialize Google Sheets
 def setup_google_sheet():
-    """Set up Google Sheets with proper formatting."""
+    """Set up Google Sheets with proper formatting for both high and low salary tabs."""
     try:
         # Initialize Google Sheets client
         logger.info("Setting up Google Sheets connection...")
@@ -651,14 +651,20 @@ def setup_google_sheet():
             logger.error(f"Failed to access Google Sheet with ID {GOOGLE_SHEET_ID}: {str(e)}")
             raise
         
-        # Create or get the main worksheet
+        # Create or get the worksheets - one for high salary and one for low salary
         try:
-            sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+            high_salary_sheet = spreadsheet.worksheet("High Salary Jobs")
         except gspread.WorksheetNotFound:
-            sheet = spreadsheet.add_worksheet(WORKSHEET_NAME, 1000, 12)
+            high_salary_sheet = spreadsheet.add_worksheet("High Salary Jobs", 1000, 12)
+            
+        try:
+            low_salary_sheet = spreadsheet.worksheet("Low Salary Jobs")
+        except gspread.WorksheetNotFound:
+            low_salary_sheet = spreadsheet.add_worksheet("Low Salary Jobs", 1000, 12)
         
         # Clear existing content
-        sheet.clear()
+        high_salary_sheet.clear()
+        low_salary_sheet.clear()
         
         # Add headers
         headers = [
@@ -666,7 +672,8 @@ def setup_google_sheet():
             'Application Link', 'Telegram Link', 'Salary', 'High Salary',
             'Schedule Type', 'Job Type', 'Fit %'
         ]
-        sheet.append_row(headers)
+        high_salary_sheet.append_row(headers)
+        low_salary_sheet.append_row(headers)
         
         # Format headers
         header_format = {
@@ -675,11 +682,12 @@ def setup_google_sheet():
             'horizontalAlignment': 'CENTER'
         }
         
-        # Apply header formatting
-        sheet.format('A1:L1', header_format)
+        # Apply header formatting to both sheets
+        high_salary_sheet.format('A1:L1', header_format)
+        low_salary_sheet.format('A1:L1', header_format)
         
         logger.info("Google Sheet setup completed successfully")
-        return sheet
+        return {"high_salary": high_salary_sheet, "low_salary": low_salary_sheet}
     except Exception as e:
         logger.error(f"Error setting up Google Sheet: {str(e)}")
         raise
@@ -980,12 +988,12 @@ async def main():
         
         # Set up Google Sheets
         logger.info("Testing Google Sheets connection...")
-        sheet = setup_google_sheet()
+        sheets = setup_google_sheet()
         logger.info("Google Sheets connection successful!")
         
         # Start monitoring
         logger.info("Script started")
-        await monitor_channels(client, sheet)
+        await monitor_channels(client, sheets)
         
     except Exception as e:
         logger.error(f"Script stopped due to error: {str(e)}")
@@ -1077,11 +1085,14 @@ async def save_to_sheet(job_data):
     """Save job data to Google Sheet with memory optimization."""
     try:
         # Initialize Google Sheets client and batch queue if not already done
-        if not hasattr(save_to_sheet, 'sheet'):
-            save_to_sheet.sheet = setup_google_sheet()
-            save_to_sheet.queue = []
+        if not hasattr(save_to_sheet, 'sheets'):
+            sheets = setup_google_sheet()
+            save_to_sheet.sheets = sheets
+            save_to_sheet.high_salary_queue = []
+            save_to_sheet.low_salary_queue = []
             save_to_sheet.last_batch_time = 0
-            save_to_sheet.next_row = 2  # Start from row 2 (after headers)
+            save_to_sheet.high_salary_next_row = 2  # Start from row 2 (after headers)
+            save_to_sheet.low_salary_next_row = 2   # Start from row 2 (after headers)
         
         # Determine schedule type and job type
         schedule_type = determine_schedule_type(job_data.get('what_they_offer', ''))
@@ -1110,55 +1121,94 @@ async def save_to_sheet(job_data):
             job_data.get('fit_percentage', '')
         ]
         
-        # Add the row to the queue
-        save_to_sheet.queue.append(row_data)
+        # Add the row to the appropriate queue
+        if high_salary:
+            save_to_sheet.high_salary_queue.append(row_data)
+            logger.info(f"Queued high salary job: {job_data.get('position', 'Unknown position')} from {job_data.get('channel', '')}")
+        else:
+            save_to_sheet.low_salary_queue.append(row_data)
+            logger.info(f"Queued low salary job: {job_data.get('position', 'Unknown position')} from {job_data.get('channel', '')}")
         
-        # Process the queue if it reaches a certain size or if enough time has passed
+        # Process the queues if they reach a certain size or if enough time has passed
         current_time = time.time()
-        queue_size = len(save_to_sheet.queue)
+        high_queue_size = len(save_to_sheet.high_salary_queue)
+        low_queue_size = len(save_to_sheet.low_salary_queue)
         time_since_last_batch = current_time - save_to_sheet.last_batch_time
         
         # Use smaller batch size on Render to reduce memory usage
         max_batch_size = 5 if RENDER else 10
         batch_interval = 20 if RENDER else 30  # seconds
         
-        # Process the queue if:
-        # 1. We have collected enough rows, or
-        # 2. It's been enough time since the last batch
-        if queue_size >= max_batch_size or (queue_size > 0 and time_since_last_batch > batch_interval):
-            await process_queue()
-        
-        logger.info(f"Queued job data: {job_data.get('position', 'Unknown position')} from {job_data.get('channel', '')}")
+        # Process the queues if:
+        # 1. Either queue has collected enough rows, or
+        # 2. It's been enough time since the last batch and we have items to process
+        if (high_queue_size >= max_batch_size or low_queue_size >= max_batch_size or 
+            (time_since_last_batch > batch_interval and (high_queue_size > 0 or low_queue_size > 0))):
+            await process_queues()
         
     except Exception as e:
         logger.error(f"Error saving to Google Sheet: {str(e)}")
         logger.error("Full traceback:", exc_info=True)
 
-async def process_queue():
-    """Process the queued job data and write to Google Sheets in batch."""
-    if not hasattr(save_to_sheet, 'queue') or not save_to_sheet.queue:
+async def process_queues():
+    """Process the queued job data for both high and low salary jobs and write to Google Sheets in batches."""
+    if (not hasattr(save_to_sheet, 'high_salary_queue') or not save_to_sheet.high_salary_queue) and \
+       (not hasattr(save_to_sheet, 'low_salary_queue') or not save_to_sheet.low_salary_queue):
         return
     
     try:
-        logger.info(f"Processing queue with {len(save_to_sheet.queue)} items")
+        high_queue_size = len(save_to_sheet.high_salary_queue) if hasattr(save_to_sheet, 'high_salary_queue') else 0
+        low_queue_size = len(save_to_sheet.low_salary_queue) if hasattr(save_to_sheet, 'low_salary_queue') else 0
         
-        # Get the current queue and reset for new items
-        queue_to_process = save_to_sheet.queue.copy()
-        save_to_sheet.queue = []
+        logger.info(f"Processing queues: {high_queue_size} high salary jobs, {low_queue_size} low salary jobs")
+        
+        # Get the current queues and reset for new items
+        high_queue_to_process = save_to_sheet.high_salary_queue.copy() if hasattr(save_to_sheet, 'high_salary_queue') else []
+        low_queue_to_process = save_to_sheet.low_salary_queue.copy() if hasattr(save_to_sheet, 'low_salary_queue') else []
+        
+        save_to_sheet.high_salary_queue = []
+        save_to_sheet.low_salary_queue = []
         save_to_sheet.last_batch_time = time.time()
+        
+        # Process high salary queue
+        if high_queue_to_process:
+            await process_single_queue("high_salary", high_queue_to_process)
+            
+        # Process low salary queue
+        if low_queue_to_process:
+            await process_single_queue("low_salary", low_queue_to_process)
+            
+    except Exception as e:
+        # Add items back to the queues if processing failed
+        if hasattr(save_to_sheet, 'high_salary_queue') and 'high_queue_to_process' in locals():
+            save_to_sheet.high_salary_queue.extend(high_queue_to_process)
+        if hasattr(save_to_sheet, 'low_salary_queue') and 'low_queue_to_process' in locals():
+            save_to_sheet.low_salary_queue.extend(low_queue_to_process)
+            
+        logger.error(f"Error processing queues: {str(e)}")
+        logger.error("Full traceback:", exc_info=True)
+
+async def process_single_queue(queue_type, queue_to_process):
+    """Process a single queue (either high or low salary) and write to the appropriate sheet."""
+    if not queue_to_process:
+        return
+        
+    try:
+        sheet = save_to_sheet.sheets[queue_type]
+        next_row_attr = f"{queue_type}_next_row"
         
         # Determine next row only once per batch
         try:
             # Get all values in column A to find the next empty row
-            all_values = save_to_sheet.sheet.col_values(1)  # Column A
+            all_values = sheet.col_values(1)  # Column A
             next_row = len(all_values) + 1
             if next_row == 1:  # Empty sheet, add headers
                 next_row = 2  # Skip header row
-            save_to_sheet.next_row = next_row
+            setattr(save_to_sheet, next_row_attr, next_row)
         except gspread.exceptions.APIError as e:
             if e.response.status_code == 429:
-                logger.warning("Rate limit exceeded when finding next row. Using estimated row.")
-                next_row = save_to_sheet.next_row
+                logger.warning(f"Rate limit exceeded when finding next row for {queue_type}. Using estimated row.")
+                next_row = getattr(save_to_sheet, next_row_attr)
                 # Add delay before proceeding
                 await asyncio.sleep(5)
             else:
@@ -1172,24 +1222,31 @@ async def process_queue():
             try:
                 # Use batch append instead of individual inserts
                 cell_range = f"A{next_row}:L{next_row + len(queue_to_process) - 1}"
-                save_to_sheet.sheet.update(cell_range, queue_to_process)
-                logger.info(f"Successfully wrote {len(queue_to_process)} rows to Google Sheet")
-                save_to_sheet.next_row += len(queue_to_process)
+                sheet.update(cell_range, queue_to_process)
+                logger.info(f"Successfully wrote {len(queue_to_process)} rows to {queue_type} sheet")
+                setattr(save_to_sheet, next_row_attr, next_row + len(queue_to_process))
                 break
             except gspread.exceptions.APIError as e:
                 if e.response.status_code == 429 and retry < max_retries - 1:
-                    logger.warning(f"Rate limit exceeded when batch writing. Retrying in {retry_delay} seconds...")
+                    logger.warning(f"Rate limit exceeded when batch writing to {queue_type}. Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                 else:
                     # If we still can't write after max retries, add items back to the queue
-                    save_to_sheet.queue.extend(queue_to_process)
-                    logger.error(f"Failed to write batch after {max_retries} attempts. Queue size: {len(save_to_sheet.queue)}")
+                    if queue_type == "high_salary":
+                        save_to_sheet.high_salary_queue.extend(queue_to_process)
+                    else:
+                        save_to_sheet.low_salary_queue.extend(queue_to_process)
+                    logger.error(f"Failed to write batch to {queue_type} after {max_retries} attempts.")
                     raise
     except Exception as e:
-        # Add items back to the queue if processing failed
-        save_to_sheet.queue.extend(queue_to_process)
-        logger.error(f"Error processing queue: {str(e)}")
+        # Add items back to the appropriate queue
+        if queue_type == "high_salary":
+            save_to_sheet.high_salary_queue.extend(queue_to_process)
+        else:
+            save_to_sheet.low_salary_queue.extend(queue_to_process)
+            
+        logger.error(f"Error processing {queue_type} queue: {str(e)}")
         logger.error("Full traceback:", exc_info=True)
 
 def extract_email(text):
