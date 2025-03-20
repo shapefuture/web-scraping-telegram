@@ -44,6 +44,24 @@ SESSION_FILE = 'session'  # Changed from 'anon' to 'session' to match existing s
 # Add after other global variables
 PROCESSED_MESSAGES_FILE = 'processed_messages.pkl'
 
+def load_processed_messages():
+    """Load the set of processed message IDs from file."""
+    try:
+        if os.path.exists(PROCESSED_MESSAGES_FILE):
+            with open(PROCESSED_MESSAGES_FILE, 'rb') as f:
+                return pickle.load(f)
+    except Exception as e:
+        logger.error(f"Error loading processed messages: {e}")
+    return set()
+
+def save_processed_messages(processed_messages):
+    """Save the set of processed message IDs to file."""
+    try:
+        with open(PROCESSED_MESSAGES_FILE, 'wb') as f:
+            pickle.dump(processed_messages, f)
+    except Exception as e:
+        logger.error(f"Error saving processed messages: {e}")
+
 # Validate required environment variables
 required_vars = {
     'API_ID': API_ID,
@@ -267,9 +285,22 @@ def parse_salary(salary_text):
         
     salary_text = salary_text.lower()
     
+    # Debug logging to diagnose parsing issues
+    logger.debug(f"Parsing salary text: {salary_text}")
+    
     # Handle various number formats:
     # 1. Replace common separators with dots and remove plus symbol
     salary_text = salary_text.replace(',', '.').replace('+', '')
+    
+    # Handle Russian salary format with "от" (from)
+    # Pattern: "от X" or "от X ₽" or "от X руб"
+    single_from_match = re.search(r'от\s*(\d+(?:\s\d+)*)\s*(?:₽|руб|р\.)?', salary_text)
+    if single_from_match:
+        # Remove spaces and convert to number
+        salary = int(single_from_match.group(1).replace(' ', ''))
+        if salary >= 100000:
+            logger.debug(f"Detected high Russian salary (от format): {salary}")
+            return True, f"{salary:,} RUB".replace(',', ' ')
     
     # Handle Russian number format with spaces and "от" (e.g., "от 80 000 до 120 000 ₽")
     if 'руб' in salary_text or '₽' in salary_text or 'р.' in salary_text or 'рублей' in salary_text:
@@ -281,6 +312,7 @@ def parse_salary(salary_text):
             max_salary = int(range_match.group(2).replace(' ', ''))
             # Consider high salary if max salary is above threshold
             if max_salary >= 100000:
+                logger.debug(f"Detected high Russian salary range (от-до format): {min_salary}-{max_salary}")
                 return True, f"{min_salary:,}-{max_salary:,} RUB".replace(',', ' ')
         
         # Then try to find a range with spaces and dash
@@ -291,6 +323,7 @@ def parse_salary(salary_text):
             max_salary = int(range_match.group(2).replace(' ', ''))
             # Consider high salary if max salary is above threshold
             if max_salary >= 100000:
+                logger.debug(f"Detected high Russian salary range (dash format): {min_salary}-{max_salary}")
                 return True, f"{min_salary:,}-{max_salary:,} RUB".replace(',', ' ')
         
         # If no range found, try to find a single number with spaces
@@ -299,7 +332,20 @@ def parse_salary(salary_text):
             # Remove spaces and convert to number
             salary = int(single_match.group(1).replace(' ', ''))
             if salary >= 100000:
+                logger.debug(f"Detected high Russian salary (single number): {salary}")
                 return True, f"{salary:,} RUB".replace(',', ' ')
+    
+    # General pattern to match salary ranges in Russian text without currency markers
+    # This will catch phrases like "от 80 000 до 120 000 в зависимости от опыта"
+    range_match = re.search(r'от\s*(\d+(?:\s\d+)*)\s*до\s*(\d+(?:\s\d+)*)', salary_text)
+    if range_match:
+        # Remove spaces and convert to numbers
+        min_salary = int(range_match.group(1).replace(' ', ''))
+        max_salary = int(range_match.group(2).replace(' ', ''))
+        # Consider high salary if max salary is above threshold
+        if max_salary >= 100000:
+            logger.debug(f"Detected high Russian salary range (general от-до): {min_salary}-{max_salary}")
+            return True, f"{min_salary:,}-{max_salary:,} RUB".replace(',', ' ')
     
     # Handle USD salary ranges (e.g., "300-2000$")
     if '$' in salary_text:
@@ -308,45 +354,52 @@ def parse_salary(salary_text):
         if range_match:
             min_salary, max_salary = map(float, range_match.groups())
             if max_salary >= 1000:  # Check max salary
+                logger.debug(f"Detected high USD salary range: {min_salary}-{max_salary}")
                 return True, f"{min_salary:,.0f}-{max_salary:,.0f} USD".replace(',', ' ')
         
-        # Then try to find a range with dots
-        range_match = re.search(r'(\d+(?:\.\d+)?)\s*[–-]\s*(\d+(?:\.\d+)?)', salary_text)
-        if range_match:
-            min_salary, max_salary = map(float, range_match.groups())
-            if max_salary >= 1000:  # Check max salary
-                return True, f"{min_salary:,.0f}-{max_salary:,.0f} USD".replace(',', ' ')
+        # Try to find a single value with dollar sign
+        single_match = re.search(r'(\d+(?:\.\d+)?)\s*\$', salary_text)
+        if single_match:
+            salary = float(single_match.group(1))
+            if salary >= 1000:
+                logger.debug(f"Detected high USD salary: {salary}")
+                return True, f"{salary:,.0f} USD".replace(',', ' ')
     
     # Handle k/K format with $ (e.g., 1.2-2.5к$, 1.2k-2.5k$)
-    if 'k' in salary_text and '$' in salary_text:
-        # Extract numbers before k/K
-        matches = re.findall(r'(\d+(?:\.\d+)?)k', salary_text)
+    if ('k' in salary_text or 'к' in salary_text) and '$' in salary_text:
+        # Extract numbers before k/K/к
+        matches = re.findall(r'(\d+(?:\.\d+)?)[kк]', salary_text)
         if matches:
             # Convert k to actual number
             numbers = [float(num) * 1000 for num in matches]
             if len(numbers) == 2:  # Range format
                 if numbers[1] >= 1000:  # Check max salary
+                    logger.debug(f"Detected high USD salary k-format range: {numbers[0]}-{numbers[1]}")
                     return True, f"{numbers[0]:,.0f}-{numbers[1]:,.0f} USD".replace(',', ' ')
             else:  # Single number
                 if numbers[0] >= 1000:
+                    logger.debug(f"Detected high USD salary k-format: {numbers[0]}")
                     return True, f"{numbers[0]:,.0f} USD".replace(',', ' ')
     
     # Handle k/K format (e.g., $26k, 26K)
-    if 'k' in salary_text:
-        # Extract the number before k/K
-        match = re.search(r'(\d+(?:\.\d+)?)k', salary_text)
+    if 'k' in salary_text or 'к' in salary_text:
+        # Extract the number before k/K/к
+        match = re.search(r'(\d+(?:\.\d+)?)[kк]', salary_text)
         if match:
             number = float(match.group(1))
             # Convert k to actual number
             number = number * 1000
             if 'usd' in salary_text or '$' in salary_text:
                 if number >= 1000:
+                    logger.debug(f"Detected high USD salary k-format: {number}")
                     return True, f"{number:,.0f} USD".replace(',', ' ')
             elif 'eur' in salary_text or '€' in salary_text:
                 if number >= 1000:
+                    logger.debug(f"Detected high EUR salary k-format: {number}")
                     return True, f"{number:,.0f} EUR".replace(',', ' ')
             elif 'руб' in salary_text or '₽' in salary_text or 'р.' in salary_text or 'рублей' in salary_text:
                 if number >= 100000:
+                    logger.debug(f"Detected high RUB salary k-format: {number}")
                     return True, f"{number:,.0f} RUB".replace(',', ' ')
     
     # Extract all numbers from the text
@@ -356,7 +409,7 @@ def parse_salary(salary_text):
     
     # Convert numbers to float
     try:
-        numbers = [float(num) for num in numbers]
+        numbers = [float(num.replace(' ', '')) for num in numbers]
     except ValueError:
         return False, None
     
@@ -364,25 +417,38 @@ def parse_salary(salary_text):
     if 'usd' in salary_text or '$' in salary_text:
         for num in numbers:
             if num >= 1000:
+                logger.debug(f"Detected high USD salary from numbers: {num}")
                 return True, f"{num:,.0f} USD".replace(',', ' ')
                 
     # Check for RUB
     if 'руб' in salary_text or '₽' in salary_text or 'р.' in salary_text or 'рублей' in salary_text:
         for num in numbers:
             if num >= 100000:
+                logger.debug(f"Detected high RUB salary from numbers: {num}")
                 return True, f"{num:,.0f} RUB".replace(',', ' ')
                 
     # Check for EUR
     if 'eur' in salary_text or '€' in salary_text:
         for num in numbers:
             if num >= 1000:
+                logger.debug(f"Detected high EUR salary from numbers: {num}")
                 return True, f"{num:,.0f} EUR".replace(',', ' ')
+    
+    # For Russian text, look for numbers ≥ 100,000 even without currency markers
+    # If we're parsing Russian text like "от 80 000 до 120 000"
+    if any(word in salary_text for word in ['от', 'до', 'рублей', 'руб']):
+        for num in numbers:
+            if num >= 100000:
+                logger.debug(f"Detected high RUB salary from context: {num}")
+                return True, f"{num:,.0f} RUB".replace(',', ' ')
                 
     # If no currency specified, assume RUB
     for num in numbers:
         if num >= 100000:
+            logger.debug(f"Detected high RUB salary (default): {num}")
             return True, f"{num:,.0f} RUB".replace(',', ' ')
             
+    logger.debug(f"No high salary detected in: {salary_text}")
     return False, None
 
 def extract_section(text, patterns):
@@ -1270,24 +1336,6 @@ def determine_job_type(text):
         job_types.append('Premium')
         
     return ', '.join(job_types) if job_types else 'Other'
-
-def load_processed_messages():
-    """Load the set of processed message IDs from file."""
-    try:
-        if os.path.exists(PROCESSED_MESSAGES_FILE):
-            with open(PROCESSED_MESSAGES_FILE, 'rb') as f:
-                return pickle.load(f)
-    except Exception as e:
-        logger.error(f"Error loading processed messages: {e}")
-    return set()
-
-def save_processed_messages(processed_messages):
-    """Save the set of processed message IDs to file."""
-    try:
-        with open(PROCESSED_MESSAGES_FILE, 'wb') as f:
-            pickle.dump(processed_messages, f)
-    except Exception as e:
-        logger.error(f"Error saving processed messages: {e}")
 
 if __name__ == "__main__":
     # Create a client instance
