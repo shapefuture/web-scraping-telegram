@@ -964,12 +964,25 @@ def run_schedule():
                     channel = await client.get_entity(channel_id)
                     await fetch_historical_messages(channel)
                     print(f"Successfully fetched historical messages from {channel.title}")
+                    # Process queue after each channel to avoid accumulating too many items
+                    if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
+                        await process_queue()
+                        # Add a delay between channels to stay within rate limits
+                        await asyncio.sleep(5)
                 except Exception as e:
                     logger.error(f"Error processing historical messages for {channel_id}: {e}")
                     logger.exception("Full traceback:")
             
+            # Process any remaining queued items
+            if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
+                await process_queue()
+                
             # Then check for new messages
             await check_channels()
+            
+            # Final processing of any remaining items
+            if hasattr(save_to_sheet, 'queue') and save_to_sheet.queue:
+                await process_queue()
             
         except Exception as e:
             logger.error(f"Error in run_monitoring: {e}")
@@ -982,12 +995,12 @@ def run_schedule():
 async def save_to_sheet(job_data):
     """Save job data to Google Sheet."""
     try:
-        # Initialize Google Sheets client if not already done
+        # Initialize Google Sheets client and batch queue if not already done
         if not hasattr(save_to_sheet, 'sheet'):
             save_to_sheet.sheet = setup_google_sheet()
-            # Initialize a cache for the next available row
+            save_to_sheet.queue = []
+            save_to_sheet.last_batch_time = 0
             save_to_sheet.next_row = 2  # Start from row 2 (after headers)
-            save_to_sheet.last_fetch_time = 0
         
         # Determine schedule type and job type
         schedule_type = determine_schedule_type(job_data.get('what_they_offer', ''))
@@ -1009,73 +1022,90 @@ async def save_to_sheet(job_data):
             job_data.get('what_they_offer', ''),
             job_data.get('application_link', ''),
             job_data.get('telegram_link', ''),
-            salary,  # Use the salary value directly
+            salary,
             'Yes' if high_salary else 'No',
             schedule_type,
             job_type,
             job_data.get('fit_percentage', '')
         ]
         
-        # Implement rate limiting with exponential backoff
+        # Add the row to the queue
+        save_to_sheet.queue.append(row_data)
+        
+        # Process the queue if it reaches a certain size or if enough time has passed
         current_time = time.time()
-        time_since_last_fetch = current_time - save_to_sheet.last_fetch_time
+        queue_size = len(save_to_sheet.queue)
+        time_since_last_batch = current_time - save_to_sheet.last_batch_time
         
-        # If we've made a request in the last second, add a delay
-        if time_since_last_fetch < 1:
-            await asyncio.sleep(1 - time_since_last_fetch)
+        # Process the queue if:
+        # 1. We have collected 10 or more rows, or
+        # 2. It's been more than 30 seconds since the last batch
+        if queue_size >= 10 or (queue_size > 0 and time_since_last_batch > 30):
+            await process_queue()
         
-        # Use batch operations to find the next empty row only occasionally
-        # Only fetch empty rows every 10 entries or if it's the first time
-        if not hasattr(save_to_sheet, 'rows_since_last_fetch'):
-            save_to_sheet.rows_since_last_fetch = 0
-            
-        if save_to_sheet.rows_since_last_fetch >= 10 or save_to_sheet.rows_since_last_fetch == 0:
-            try:
-                # Get all values in column A to find the next empty row
-                all_values = save_to_sheet.sheet.col_values(1)  # Column A
-                save_to_sheet.next_row = len(all_values) + 1
-                if save_to_sheet.next_row == 1:  # Empty sheet, add headers
-                    save_to_sheet.next_row = 2  # Skip header row
-                save_to_sheet.last_fetch_time = time.time()
-                save_to_sheet.rows_since_last_fetch = 0
-            except gspread.exceptions.APIError as e:
-                if e.response.status_code == 429:
-                    logger.warning("Rate limit exceeded when finding next row. Backing off and using estimated row.")
-                    # Use current next_row + 1 as a fallback
-                    save_to_sheet.next_row += 1
-                    # Add delay before proceeding
-                    await asyncio.sleep(2)
-                else:
-                    raise
-        else:
-            # If we haven't fetched the sheet data, assume the next row is the current + 1
-            save_to_sheet.next_row += 1
-            save_to_sheet.rows_since_last_fetch += 1
-            
-        # Try to add the row with exponential backoff
-        max_retries = 5
-        retry_delay = 1
-        
-        for retry in range(max_retries):
-            try:
-                # Append row to sheet
-                save_to_sheet.sheet.insert_row(row_data, save_to_sheet.next_row)
-                break
-            except gspread.exceptions.APIError as e:
-                if e.response.status_code == 429 and retry < max_retries - 1:
-                    logger.warning(f"Rate limit exceeded when inserting row. Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    raise
-                    
-        logger.info(f"Saved job data to Google Sheet: {job_data.get('position', 'Unknown position')} with salary: {salary}")
+        logger.info(f"Queued job data: {job_data.get('position', 'Unknown position')} from {job_data.get('channel', '')}")
         
     except Exception as e:
         logger.error(f"Error saving to Google Sheet: {str(e)}")
         logger.error("Full traceback:", exc_info=True)
-        # Continue processing other messages even if this one fails
-        # But still log it so we're aware
+
+async def process_queue():
+    """Process the queued job data and write to Google Sheets in batch."""
+    if not hasattr(save_to_sheet, 'queue') or not save_to_sheet.queue:
+        return
+    
+    try:
+        logger.info(f"Processing queue with {len(save_to_sheet.queue)} items")
+        
+        # Get the current queue and reset for new items
+        queue_to_process = save_to_sheet.queue.copy()
+        save_to_sheet.queue = []
+        save_to_sheet.last_batch_time = time.time()
+        
+        # Determine next row only once per batch
+        try:
+            # Get all values in column A to find the next empty row
+            all_values = save_to_sheet.sheet.col_values(1)  # Column A
+            next_row = len(all_values) + 1
+            if next_row == 1:  # Empty sheet, add headers
+                next_row = 2  # Skip header row
+            save_to_sheet.next_row = next_row
+        except gspread.exceptions.APIError as e:
+            if e.response.status_code == 429:
+                logger.warning("Rate limit exceeded when finding next row. Using estimated row.")
+                next_row = save_to_sheet.next_row
+                # Add delay before proceeding
+                await asyncio.sleep(5)
+            else:
+                raise
+        
+        # Try to batch append the rows with exponential backoff
+        max_retries = 5
+        retry_delay = 2
+        
+        for retry in range(max_retries):
+            try:
+                # Use batch append instead of individual inserts
+                cell_range = f"A{next_row}:L{next_row + len(queue_to_process) - 1}"
+                save_to_sheet.sheet.update(cell_range, queue_to_process)
+                logger.info(f"Successfully wrote {len(queue_to_process)} rows to Google Sheet")
+                save_to_sheet.next_row += len(queue_to_process)
+                break
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429 and retry < max_retries - 1:
+                    logger.warning(f"Rate limit exceeded when batch writing. Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    # If we still can't write after max retries, add items back to the queue
+                    save_to_sheet.queue.extend(queue_to_process)
+                    logger.error(f"Failed to write batch after {max_retries} attempts. Queue size: {len(save_to_sheet.queue)}")
+                    raise
+    except Exception as e:
+        # Add items back to the queue if processing failed
+        save_to_sheet.queue.extend(queue_to_process)
+        logger.error(f"Error processing queue: {str(e)}")
+        logger.error("Full traceback:", exc_info=True)
 
 def extract_email(text):
     """Extract email address from text."""
