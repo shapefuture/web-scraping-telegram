@@ -1067,8 +1067,14 @@ if __name__ == "__main__":
             # Try to use existing session
             try:
                 logger.info("Attempting to use existing session...")
-                loop.run_until_complete(client.start())
-                logger.info("Successfully authenticated using existing session")
+                # Check if session file exists
+                if os.path.exists(f"{SESSION_FILE}.session"):
+                    # Try to sign in without prompting
+                    loop.run_until_complete(client.sign_in())
+                    logger.info("Successfully authenticated using existing session")
+                else:
+                    logger.error("No session file found. Please run the script locally first to create a session file")
+                    raise FileNotFoundError("No session file found")
             except Exception as e:
                 logger.error(f"Failed to use existing session: {e}")
                 logger.error("Please run the script locally first to create a session file")
