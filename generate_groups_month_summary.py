@@ -64,8 +64,8 @@ def create_group_month_summary(folder_path, input_filename, output_filename_base
         # Reindex to include all months from the first to the last
         all_months = pd.period_range(start=df_contents.columns.min(), end=df_contents.columns.max(), freq='M')
         df_contents = df_contents.reindex(columns=all_months, fill_value=0)
-        df_comments = df_comments.reindex(columns=all_months, fill_value=0)
-        df_total = df_total.reindex(columns=all_months, fill_value=0)
+        df_comments = df_comments.reindex(columns=df_contents.columns, fill_value=0) # Reuse columns index
+        df_total = df_total.reindex(columns=df_contents.columns, fill_value=0) # Reuse columns index
 
         # Convert the PeriodIndex back to string format for Excel compatibility
         df_contents.columns = df_contents.columns.astype(str)

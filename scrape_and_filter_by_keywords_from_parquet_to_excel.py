@@ -55,8 +55,8 @@ def filter_and_save_by_keywords(folder_path, input_filename, output_filename, co
 
         # Create a new column for each keyword
         print("Creating keyword columns...")
-        for keyword in tqdm(keywords, desc="Creating keyword columns"):
-            df[keyword] = df[content_col].astype(str).apply(lambda x: 1 if keyword in x else 0)
+        keyword_cols = {keyword: df[content_col].str.contains(keyword, case=False).astype(int) for keyword in keywords}
+        df = df.assign(**keyword_cols)
 
         # Add a column that counts the number of keywords found in each row
         print("Adding count of keywords found...")
