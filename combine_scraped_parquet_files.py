@@ -63,14 +63,15 @@ def combine_parquet_files(folder_path, duplicate_columns, output_file_path):
     def count_comments(comments_list):
         if pd.isna(comments_list):
             return 0
-        comments_list = json.loads(comments_list)
-        return sum(1 for item in comments_list if item.get('Type') == 'comment')
+        return sum(1 for item in json.loads(comments_list) if isinstance(item, dict) and item.get('Type') == 'comment')
 
     if 'Comments' not in combined_df.columns:
         combined_df['Comments'] = 0
 
-    combined_df['Comments'] = [count_comments(row['Comments List']) for row in
-                               tqdm(combined_df.to_dict(orient="records"), desc="Calculating Comments")]
+    comments_counts = []
+    for row in tqdm(combined_df.itertuples(), total=len(combined_df), desc="Calculating Comments"):
+        comments_counts.append(count_comments(row._asdict()['Comments List']))
+    combined_df['Comments'] = comments_counts
 
     combined_df['Comments'] = combined_df['Comments'].astype(int)
     combined_df['Media'] = combined_df['Media'].astype(bool)

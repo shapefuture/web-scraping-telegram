@@ -33,7 +33,7 @@ def sample_data_proportionally(df, text_column, category_column, sample_size):
     # Returns:
     # DataFrame: A DataFrame containing the sampled data.
     
-    sample_df = pd.DataFrame()
+    sample_dfs = []
     categories = df[category_column].unique()
     total_rows = len(df)
 
@@ -57,8 +57,9 @@ def sample_data_proportionally(df, text_column, category_column, sample_size):
             # If all text_column entries are empty, sample from the original category_df
             category_sample = category_df.sample(category_sample_size, replace=True)
 
-        sample_df = pd.concat([sample_df, category_sample])
+        sample_dfs.append(category_sample)
 
+    sample_df = pd.concat(sample_dfs, ignore_index=True)
     return sample_df
 
 def create_sampled_file(folder_path, input_filename, text_column, category_column, sample_size, output_filename, min_length):
